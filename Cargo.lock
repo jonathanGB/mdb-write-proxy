@@ -165,7 +165,6 @@ checksum = "80094f509cf8b5ae86a4966a39b3ff66cd7e2a3e594accec3743ff3fabeab5b2"
 dependencies = [
  "num-integer",
  "num-traits",
- "serde",
  "time",
 ]
 
@@ -426,7 +425,6 @@ name = "mdb-write-proxy"
 version = "0.1.0"
 dependencies = [
  "mysql",
- "mysql_common 0.21.0",
  "serde_json",
  "sqlparser",
 ]
@@ -456,7 +454,7 @@ dependencies = [
  "io-enum",
  "libc",
  "lru",
- "mysql_common 0.20.1",
+ "mysql_common",
  "named_pipe",
  "native-tls",
  "net2",
@@ -474,36 +472,6 @@ name = "mysql_common"
 version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0289906e4d274efa71fd3d27c2db36de7b5518995286021dfb134faf259659de"
-dependencies = [
- "base64",
- "bigdecimal",
- "bitflags",
- "byteorder",
- "bytes",
- "chrono",
- "failure",
- "flate2",
- "lazy_static",
- "lexical",
- "num-bigint",
- "num-traits",
- "rand",
- "regex",
- "rust_decimal",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "time",
- "twox-hash",
- "uuid",
-]
-
-[[package]]
-name = "mysql_common"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2f612a8e5d723ab0ecd2e424f88df298bd9d3eb8d40b80cd293c6126b25bdf3"
 dependencies = [
  "base64",
  "bigdecimal",

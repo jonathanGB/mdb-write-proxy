@@ -8,6 +8,5 @@ edition = "2018"
 
 [dependencies]
 mysql = "18.1.0"
-mysql_common = "0.21.0"
 serde_json = "1.0.50"
 sqlparser = "0.5.0"
