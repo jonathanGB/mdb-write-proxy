@@ -1,17 +1,20 @@
+use mysql::{IsolationLevel, Pool, TxOpts};
 use mysql::prelude::*;
+use sqlparser::ast::Statement::CreateTable;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 use std::collections::HashMap;
 use std::fs;
 
-type Message = (u64, u64, String);
-
 fn main() {
     let policy_content = fs::read_to_string("src/twitter-write-policies.json").unwrap();
     let policy_content_json : serde_json::Value = serde_json::from_str(&policy_content).unwrap();
+    let policies = match WriteProxy::parse_policy_content(policy_content_json) {
+        Ok(policies) => policies,
+        Err(e) => return println!("Problem parsing policy file: {}", e),
+    };
+
     let pool = WriteProxy::default_pool().unwrap();
-    let policies = WriteProxy::parse_policy_content(policy_content_json);
-    println!("{:?}", policies);
     let mut write_proxy = WriteProxy::new(pool, policies);
 
     let messages_sql = r"
@@ -22,98 +25,104 @@ fn main() {
     );
     ";
 
-    write_proxy.extend_recipe(messages_sql);
-    let insert_res = write_proxy.insert("Messages", vec![1.into(), 4.into(), "message from #1 to #4".into()]);
-    println!("{:?}", insert_res);
+    if let Err(e) = write_proxy.extend_recipe(messages_sql) {
+        println!("Problem creating Messages table: {:?}", e);
+        return;
+    }
+
+    match write_proxy.insert("Messages", vec![3.into(), 2.into(), "message from #3 to #2".into()]) {
+        Ok(_) => println!("Success inserting!"),
+        Err(e) => println!("Problem inserting: {:?}", e), 
+    };
+    match write_proxy.insert("Messages", vec![2.into(), 3.into(), "message from #3 to #3".into()]) {
+        Ok(_) => println!("Success inserting!"),
+        Err(e) => println!("Problem inserting: {:?}", e), 
+    };
 }
 
 struct WriteProxy {
-    pool: mysql::Pool,
+    pool: Pool,
     tables: HashMap<String, TableInfo>,
 }
 
 #[derive(Debug)]
 enum WriteProxyErr<'a> {
     MysqlErr(mysql::Error),
-    PolicyErr(String),
     MissingTable(&'a str),
     ParserErr(ParserError),
+    PolicyNotInserted,
 }
 
 #[derive(Debug)]
 struct TableInfo {
-    policies: Option<Policies>,
-    columns: Option<(HashMap<String, usize>, Vec<String>)>,
+    policies: Option<PoliciesInfo>,
+    column_names: Option<Vec<String>>,
 }
-type Policies = (Vec<(String, QueryParams)>, (String, QueryParams));
-type QueryParams = Vec<String>;
+
+#[derive(Debug)]
+struct PoliciesInfo {
+    startup_policies: Vec<String>,
+    predicate: String,
+}
 
 impl WriteProxy {
     pub fn default_pool() -> Result<mysql::Pool, mysql::Error> {
-        mysql::Pool::new("mysql://root:@localhost:3306/mdb")
+        Pool::new("mysql://root:@localhost:3306/mdb")
     }
 
-    pub fn parse_policy_content(policies: serde_json::Value) -> HashMap<String, TableInfo> {
-        if !policies.is_object() {
-            unreachable!("Policy file should be a JSON object!");
-        }
-
+    pub fn parse_policy_content(policies: serde_json::Value) -> Result<HashMap<String, TableInfo>, String> {
         let mut tables = HashMap::default();
-        for (table, table_obj) in policies.as_object().unwrap() {
-            if !table_obj.is_object() {
-                unreachable!(format!("Entry {} should be an object!", table));
+
+        let policies = match policies.as_object() {
+            Some(policies) => policies,
+            None => return Err("Policy file should be a JSON object!".to_string()),
+        };
+
+        for (table, table_obj) in policies {
+            let table_policies = match table_obj.as_object() {
+                Some(table_policies) => table_policies,
+                None => return Err(format!("Entry {} should be an object!", table)),
+            };
+
+            let startup = match table_policies.get("startup") {
+                Some(startup) => startup,
+                None => return Err(format!("Entry {} has no `startup` set!", table)),
+            };
+            let startup = match startup.as_array() {
+                Some(startup) => startup,
+                None => return Err(format!("Entry {} has a `startup` set, but it should be an array!", table)),
+            };
+
+            let mut startup_policies = Vec::new();
+            for startup_policy in startup {
+                match startup_policy.as_str() {
+                    Some(startup_policy) => startup_policies.push(startup_policy.to_string()),
+                    None => return Err(format!("Entry {} `startup` policies should be strings!", table)),
+                };
             }
 
-            let table_policies = table_obj.as_object().unwrap();
-            let startup_policies = table_policies.get("startup");
-            let predicate = table_policies.get("predicate");
-
-            if startup_policies.is_none() {
-                unreachable!(format!("Entry {} has no `startup` set!", table));
-            }
-            if predicate.is_none() {
-                unreachable!(format!("Entry {} has no `predicate` set!", table));
-            }
-
-            let startup_policies = startup_policies.unwrap();
-            let predicate = predicate.unwrap();
-
-            if !startup_policies.is_array() {
-                unreachable!(format!("Entry {} has a `startup` set, but it should be an array!", table));
-            }
-
-            if !predicate.is_string() {
-                unreachable!(format!("Entry {} has a `predicate` set, but it should be a string!", table));
-            }
-
-            let policies = startup_policies.as_array().unwrap().iter().enumerate().map(|(i, startup_policy)| {
-                if !startup_policy.is_string() {
-                    unreachable!(format!("Entry {} `startup` #{} should be a string!", table, i));
-                }
-
-                let policy = startup_policy.as_str().unwrap().to_string();
-                let policy_query_params = Self::get_query_params(&policy);
-                (policy, policy_query_params)
-            }).collect();
-            let predicate = predicate.as_str().unwrap().to_string();
-            let predicate_query_params = Self::get_query_params(&predicate);
-            let predicate_query_params = (predicate, predicate_query_params);
+            let predicate = match table_policies.get("predicate") {
+                Some(predicate) => predicate,
+                None => return Err(format!("Entry {} has no `predicate` set!", table)),
+            };
+            let predicate = match predicate.as_str() {
+                Some(predicate) => predicate.to_string(),
+                None => return Err(format!("Entry {} has a `predicate` set, but it should be a string!", table)),
+            };
 
             tables.insert(table.clone(), TableInfo{
-                policies: Some((policies, predicate_query_params)),
-                columns: None,
+                policies: Some(PoliciesInfo{
+                    startup_policies,
+                    predicate,
+                }),
+                column_names: None,
             });
         }
 
-        tables
+        Ok(tables)
     }
 
-    fn get_query_params(query: &str) -> QueryParams {
-        use mysql_common::named_params::parse_named_params;
-        parse_named_params(query).unwrap().0.unwrap_or(vec![])
-    }
-
-    pub fn new(pool: mysql::Pool, tables: HashMap<String, TableInfo>) -> Self {
+    pub fn new(pool: Pool, tables: HashMap<String, TableInfo>) -> Self {
         Self {
             pool,
             tables,
@@ -128,121 +137,95 @@ impl WriteProxy {
     }
 
     pub fn extend_recipe(&mut self, stmt: &str) -> Result<(), WriteProxyErr> {
-        use sqlparser::ast::Statement::CreateTable;
-
-        let sql_dialect = MySqlDialect{};
-        let query = Parser::parse_sql(&sql_dialect, stmt.to_string());
-        if query.is_err() {
-            return Err(WriteProxyErr::ParserErr(query.unwrap_err().clone()));
-        }
-        let query = &query.unwrap()[0];
+        let query = match Parser::parse_sql(&MySqlDialect{}, stmt.to_string()) {
+            Ok(mut query) => query.swap_remove(0),
+            Err(e) => return Err(WriteProxyErr::ParserErr(e)),
+        };
 
         // If we have a `Create Table` statement, propagate it to our SQL table.
         // Also, keep track of the columns, so that subsequent INSERT/UPDATEs values
         // can be interpolated.
         if let CreateTable{name, columns, ..} = query {
-            let mut conn = self.pool.get_conn().unwrap();
-            let create_table_res : Result<(), _> = conn.query_drop(stmt);
-            if create_table_res.is_err() {
-                return Err(WriteProxyErr::MysqlErr(create_table_res.unwrap_err()));
+            let mut conn = match self.pool.get_conn() {
+                Ok(conn) => conn,
+                Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+            };
+            if let Err(e) = conn.query_drop(stmt) {
+                return Err(WriteProxyErr::MysqlErr(e));
             }
 
             // TODO: we only remember the first part of the table name.
             // If we were given `my_db.my_table`, this would not work properly.
             // This should not be a problem, because Noria doesn't have such notation.
-            let table_name = name.0[0].to_string();
+            let table_name = name.0[0].clone();
             let column_names = columns.iter().map(|column| column.name.clone()).collect::<Vec<String>>();
-            let columns : HashMap<String, usize> = column_names.iter().enumerate().map(|(i, column_name)| (column_name.clone(), i)).collect();
-            let columns = (columns, column_names);
 
             self.tables.entry(table_name)
                 .or_insert(TableInfo{
                     policies: None,
-                    columns: None,
+                    column_names: None,
                 })
-                .columns = Some(columns);
+                .column_names = Some(column_names);
         }
 
         // TODO: Propagate to Noria!
         Ok(())
     }
 
-    pub fn insert<'a>(&'a mut self, table_name: &'a str, mut records: Vec<mysql::Value>) -> Result<u64, WriteProxyErr<'a>> {
+    pub fn insert<'a>(&'a mut self, table_name: &'a str, records: Vec<mysql::Value>) -> Result<(), WriteProxyErr<'a>> {
         let table = self.tables.get(table_name);
-        if table.is_none() || table.unwrap().columns.is_none() {
+        if table.is_none() || table.unwrap().column_names.is_none() {
             return Err(WriteProxyErr::MissingTable(table_name));
         }
 
-        let conn = self.pool.get_conn();
-        if conn.is_err() {
-            return Err(WriteProxyErr::MysqlErr(conn.unwrap_err()));
-        }
-        let mut conn = conn.unwrap();
-        let tx = conn.start_transaction(Default::default());
-        if tx.is_err() {
-            return Err(WriteProxyErr::MysqlErr(tx.unwrap_err()));
-        }
-        let mut tx = tx.unwrap();
-
         let table_info = table.unwrap();
-        let columns = table_info.columns.as_ref().unwrap();
-        match table_info.policies {
-            Some((ref policies, ref predicate)) => {
-                // Apply all policies.
-                for (policy, params) in policies {
-                    let params_values = params.iter().map(|param|
-                        match columns.0.get(param) {
-                            Some(param_idx) => records[*param_idx].clone(),
-                            None => unreachable!(), //return Err(WriteProxyErr::MissingColumn(param)),
-                        }
-                    )
-                    .collect::<Vec<mysql::Value>>();
 
-                    let tx_res : Result<(), _> = tx.exec_drop(policy, params_values);
-                    println!("{:?}", tx_res);
+        // If we have policies for this table, we must go through:
+        //   1. Get a conn to the SQL table.
+        //   2. Interpolate the startup policies + predicate
+        //   3. If the insertion passed, we can continue to Noria.
+        if let Some(PoliciesInfo {ref startup_policies, ref predicate}) = table_info.policies {
+            let tx_options = TxOpts::default().set_isolation_level(Some(IsolationLevel::Serializable));
+            let mut tx = match self.pool.start_transaction(tx_options) {
+                Ok(tx) => tx,
+                Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+            };
+
+            let column_names = table_info.column_names.as_ref().unwrap();
+
+            let params : Vec<(String, mysql::Value)> = column_names.iter()
+                .enumerate()
+                .map(|(i, column_name)| (column_name.clone(), records[i].clone()))
+                .collect();
+            for policy in startup_policies {
+                if let Err(e) = tx.exec_drop(policy, &params) {
+                    return Err(WriteProxyErr::MysqlErr(e));
                 }
-
-                // Apply the insertion predicate.
-                let (predicate, predicate_params) = predicate;
-                let params_values = predicate_params.iter().map(|param|
-                    match columns.0.get(param) {
-                        Some(param_idx) => records[*param_idx].clone(),
-                        None => unreachable!(), //return Err(WriteProxyErr::MissingColumn(param)),
-                    }
-                )
-                .collect::<Vec<mysql::Value>>();
-
-                let insert_predicate = format!("INSERT INTO {} ({}) SELECT {} {}",
-                    table_name,
-                    columns.1.join(","),
-                    columns.1.iter().map(|col| format!(":{}", col)).collect::<Vec<String>>().join(","),
-                    predicate);
-
-                records.extend(params_values);
-
-                let tx_res : Result<(), _> = tx.exec_drop(insert_predicate, records);
-                println!("{:?}", tx_res);
             }
-            None => {
-                // TODO: Just propagate write to Noria!
+
+            let insert_predicate = format!("INSERT INTO {} ({}) SELECT {} {}",
+                table_name,
+                column_names.join(","),
+                column_names.iter().map(|col| format!(":{}", col)).collect::<Vec<String>>().join(","),
+                predicate);
+
+            if let Err(e) = tx.exec_drop(insert_predicate, params) {
+                return Err(WriteProxyErr::MysqlErr(e));
             }
-        };
 
-        let row_count : Result<Option<i64>, _> = tx.query_first("SELECT row_count();");
-        if row_count.is_err() {
-            return Err(WriteProxyErr::MysqlErr(row_count.unwrap_err()));
-        }
-        let tx_res = tx.commit();
-        if tx_res.is_err() {
-            return Err(WriteProxyErr::MysqlErr(tx_res.unwrap_err()));
-        }
+            match tx.query_first::<u8, _>("SELECT row_count();") {
+                Ok(Some(num)) if num == 0 => return Err(WriteProxyErr::PolicyNotInserted),
+                Ok(Some(_)) => {}, // Insert worked, move on.
+                Ok(None) => unreachable!("SELECT row_count() must return something!"),
+                Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+            };
 
-        if row_count.unwrap().unwrap() == 0 {
-            return Ok(0);
+            if let Err(e) = tx.commit() {
+                return Err(WriteProxyErr::MysqlErr(e));
+            }
         }
-
         // TODO: propagate write to Noria!
 
-        Ok(1)
+        Ok(())
     }
 }
