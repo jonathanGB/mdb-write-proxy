@@ -165,6 +165,7 @@ checksum = "80094f509cf8b5ae86a4966a39b3ff66cd7e2a3e594accec3743ff3fabeab5b2"
 dependencies = [
  "num-integer",
  "num-traits",
+ "serde",
  "time",
 ]
 
@@ -425,6 +426,9 @@ name = "mdb-write-proxy"
 version = "0.1.0"
 dependencies = [
  "mysql",
+ "mysql_common 0.21.0",
+ "serde_json",
+ "sqlparser",
 ]
 
 [[package]]
@@ -444,15 +448,15 @@ dependencies = [
 
 [[package]]
 name = "mysql"
-version = "18.0.0"
+version = "18.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1517ee5b30fcf7de2788e4b6d0900a405b87584eb0f0e49202937557d6ce4d2a"
+checksum = "51394b082e3f89f5b54a0b5beae7b7efbfe42569fd8eeb20acc481750d70ba35"
 dependencies = [
  "bufstream",
  "io-enum",
  "libc",
  "lru",
- "mysql_common",
+ "mysql_common 0.20.1",
  "named_pipe",
  "native-tls",
  "net2",
@@ -470,6 +474,36 @@ name = "mysql_common"
 version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0289906e4d274efa71fd3d27c2db36de7b5518995286021dfb134faf259659de"
+dependencies = [
+ "base64",
+ "bigdecimal",
+ "bitflags",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "failure",
+ "flate2",
+ "lazy_static",
+ "lexical",
+ "num-bigint",
+ "num-traits",
+ "rand",
+ "regex",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "time",
+ "twox-hash",
+ "uuid",
+]
+
+[[package]]
+name = "mysql_common"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2f612a8e5d723ab0ecd2e424f88df298bd9d3eb8d40b80cd293c6126b25bdf3"
 dependencies = [
  "base64",
  "bigdecimal",
@@ -824,15 +858,15 @@ checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
 name = "serde"
-version = "1.0.104"
+version = "1.0.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "414115f25f818d7dfccec8ee535d76949ae78584fc4f79a6f45a904bf8ab4449"
+checksum = "e707fbbf255b8fc8c3b99abb91e7257a622caeb20a9818cbadbeeede4e0932ff"
 
 [[package]]
 name = "serde_json"
-version = "1.0.48"
+version = "1.0.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9371ade75d4c2d6cb154141b9752cf3781ec9c05e0e5cf35060e1e70ee7b9c25"
+checksum = "78a7a12c167809363ec3bd7329fc0a3369056996de43c4b37ef3cd54a6ce4867"
 dependencies = [
  "itoa",
  "ryu",
@@ -862,6 +896,15 @@ name = "smallvec"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c2fb2ec9bcd216a5b0d0ccf31ab17b5ed1d627960edff65bbe95d3ce221cefc"
+
+[[package]]
+name = "sqlparser"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7ac1f0f284146472a721eb7b5cb4615e314c781f5f7be41d27aa98d9e0a1ff9"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "static_assertions"

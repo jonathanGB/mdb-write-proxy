@@ -1,0 +1,10 @@
+{
+    "Messages": {
+        "startup": [
+            "SELECT True INTO @users_with_open_dms FROM Users WHERE is_open_dms = True AND id = :sendee_id;",
+            "SELECT True INTO @users_who_follow_sender FROM Follows WHERE followed_id = :sender_id AND user_id = :sendee_id;"
+        ],
+        "predicate": "WHERE @users_with_open_dms = True OR @users_who_follow_sender = True;",
+        "description": "Only message users that have open DMs, or users that follow you."
+    }
+}
