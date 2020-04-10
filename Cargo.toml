@@ -8,5 +8,8 @@ edition = "2018"
 
 [dependencies]
 mysql = "18.1.0"
-serde_json = "1.0.50"
+serde_json = "1.0.51"
 sqlparser = "0.5.0"
+noria = { git = "https://github.com/jonathanGB/noria/", branch = "mysql-try-from-datatype" }
+tokio = { version = "0.2.16", features = ["macros"] }
+failure = "0.1.7"
