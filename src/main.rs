@@ -8,10 +8,11 @@ use sqlparser::parser::{Parser, ParserError};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
+use std::time::Instant;
 
 #[tokio::main]
 async fn main() {
-    let db = ControllerHandle::from_zk("localhost:2181/go22")
+    let db = ControllerHandle::from_zk("localhost:2181/gogo8")
         .await
         .unwrap();
     let policy_content = fs::read_to_string("src/twitter-write-policies.json").unwrap();
@@ -62,7 +63,7 @@ async fn main() {
         )
         .await
     {
-        Ok(_) => println!("Success inserting!"),
+        Ok(delay) => println!("Success inserting!: {:?}", delay),
         Err(e) => println!("Problem inserting: {:?}", e),
     };
 
@@ -78,7 +79,7 @@ async fn main() {
         )
         .await
     {
-        Ok(_) => println!("Success inserting!"),
+        Ok(delay) => println!("Success inserting!: {:?}", delay),
         Err(e) => println!("Problem inserting: {:?}", e),
     };
 
@@ -94,13 +95,33 @@ async fn main() {
         )
         .await
     {
-        Ok(_) => println!("Success inserting!"),
+        Ok(delay) => println!("Success inserting!: {:?}", delay),
         Err(e) => println!("Problem inserting: {:?}", e),
     };
 
     println!(
         "{:?}",
         messages_view.lookup(&[3.into()], true).await.unwrap()
+    );
+
+    match write_proxy
+        .insert(
+            "Messages",
+            vec![
+                1083.into(),
+                1000737.into(),
+                "message from #1083 to #1000737".into(),
+            ],
+        )
+        .await
+    {
+        Ok(delay) => println!("Success inserting!: {:?}", delay),
+        Err(e) => println!("Problem inserting: {:?}", e),
+    };
+
+    println!(
+        "{:?}",
+        messages_view.lookup(&[1083.into()], true).await.unwrap()
     );
 }
 
@@ -132,6 +153,19 @@ struct TableInfo {
 struct PoliciesInfo {
     startup_policies: Vec<String>,
     predicate: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct InsertDelay {
+    fetch_table_info: Option<u128>,
+    start_transaction: Option<u128>,
+    populate_params: Option<u128>,
+    run_policies: Option<Vec<u128>>,
+    run_insert: Option<u128>,
+    run_select_count: Option<u128>,
+    commit: Option<u128>,
+    convert_to_noria_type: Option<u128>,
+    send_to_noria_server: Option<u128>,
 }
 
 impl WriteProxy {
@@ -294,16 +328,20 @@ impl WriteProxy {
     }
 
     pub async fn insert<'a>(
-        &'a mut self,
+        &mut self,
         table_name: &'a str,
         records: Vec<mysql::Value>,
-    ) -> Result<(), WriteProxyErr<'a>> {
+    ) -> Result<InsertDelay, (InsertDelay, WriteProxyErr<'a>)> {
+        let mut delays = InsertDelay::default();
+
+        let now = Instant::now();
         let table = self.tables.get(table_name);
         if table.is_none() || table.unwrap().column_names.is_none() {
-            return Err(WriteProxyErr::MissingTable(table_name));
+            return Err((delays, WriteProxyErr::MissingTable(table_name)));
         }
 
         let table_info = table.unwrap();
+        delays.fetch_table_info = Some(now.elapsed().as_micros());
 
         // If we have policies for this table, we must go through:
         //   1. Get a transaction conn to the SQL table.
@@ -316,14 +354,17 @@ impl WriteProxy {
             ref predicate,
         }) = table_info.policies
         {
+            let now = Instant::now();
             // 1. Start transaction, with serializable isolation level.
             let tx_options =
                 TxOpts::default().set_isolation_level(Some(IsolationLevel::Serializable));
             let mut tx = match self.pool.start_transaction(tx_options) {
                 Ok(tx) => tx,
-                Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+                Err(e) => return Err((delays, WriteProxyErr::MysqlErr(e))),
             };
+            delays.start_transaction = Some(now.elapsed().as_micros());
 
+            let now = Instant::now();
             let column_names = table_info.column_names.as_ref().unwrap();
 
             let params: Vec<(String, mysql::Value)> = column_names
@@ -331,14 +372,23 @@ impl WriteProxy {
                 .enumerate()
                 .map(|(i, column_name)| (column_name.clone(), records[i].clone().into()))
                 .collect();
+            delays.populate_params = Some(now.elapsed().as_micros());
+            delays.run_policies = Some(vec![]);
 
             // 2. Execute startup policies.
             for policy in startup_policies {
+                let now = Instant::now();
                 if let Err(e) = tx.exec_drop(policy, &params) {
-                    return Err(WriteProxyErr::MysqlErr(e));
+                    return Err((delays, WriteProxyErr::MysqlErr(e)));
                 }
+                delays
+                    .run_policies
+                    .as_mut()
+                    .unwrap()
+                    .push(now.elapsed().as_micros());
             }
 
+            let now = Instant::now();
             // Interpolate the insertion predicate.
             let insert_predicate = format!(
                 "INSERT INTO {} ({}) SELECT {} {}",
@@ -354,39 +404,54 @@ impl WriteProxy {
 
             // 3. Execute the predicate.
             if let Err(e) = tx.exec_drop(insert_predicate, params) {
-                return Err(WriteProxyErr::MysqlErr(e));
+                return Err((delays, WriteProxyErr::MysqlErr(e)));
             }
+            delays.run_insert = Some(now.elapsed().as_micros());
+            let now = Instant::now();
 
             // 4. Test the insertion. If `row_count()` is 0, then we know that
             // no rows were inserted. If it's more than 0, then insertion passed
             // all the policies.
             match tx.query_first::<u8, _>("SELECT row_count();") {
-                Ok(Some(num)) if num == 0 => return Err(WriteProxyErr::PolicyNotInserted),
+                Ok(Some(num)) if num == 0 => {
+                    return Err((delays, WriteProxyErr::PolicyNotInserted))
+                }
                 Ok(Some(_)) => {} // Insert worked, move on.
                 Ok(None) => unreachable!("SELECT row_count() must return something!"),
-                Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+                Err(e) => return Err((delays, WriteProxyErr::MysqlErr(e))),
             };
+
+            delays.run_select_count = Some(now.elapsed().as_micros());
+            let now = Instant::now();
 
             // Don't propagate write to Noria, unless the transaction commits.
             if let Err(e) = tx.commit() {
-                return Err(WriteProxyErr::MysqlErr(e));
+                return Err((delays, WriteProxyErr::MysqlErr(e)));
             }
+            delays.commit = Some(now.elapsed().as_micros());
         }
 
+        let now = Instant::now();
         // 4a. Propagate write to Noria!
         let mut records_noria = Vec::new();
         for record in records {
             match DataType::try_from(record) {
                 Ok(record) => records_noria.push(record),
-                Err(e) => return Err(WriteProxyErr::MysqlToNoriaDatatypeErr(e)),
+                Err(e) => return Err((delays, WriteProxyErr::MysqlToNoriaDatatypeErr(e))),
             };
         }
+        delays.convert_to_noria_type = Some(now.elapsed().as_micros());
+        let now = Instant::now();
 
         match self.write_handles.get_mut(table_name) {
             Some(write_handle) => write_handle
                 .insert(records_noria)
                 .await
-                .map_err(|e| WriteProxyErr::TableErr(e)),
+                .map_err(|e| (delays.clone(), WriteProxyErr::TableErr(e)))
+                .map(|_| {
+                    delays.send_to_noria_server = Some(now.elapsed().as_micros());
+                    delays
+                }),
             None => unreachable!(format!("No table handle registered for {}", table_name)),
         }
     }
