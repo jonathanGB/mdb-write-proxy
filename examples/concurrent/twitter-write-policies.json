@@ -1,0 +1,10 @@
+{
+    "Messages": {
+        "startup": [
+            "SELECT @user_with_open_dms := IF(COUNT(*) = 0, False, True) FROM Users WHERE is_open_dms = True AND id = :sendee_id;",
+            "SELECT @user_who_follow_sender := IF(COUNT(*) = 0, False, True) FROM Follows WHERE followed_id = :sender_id AND user_id = :sendee_id;"
+        ],
+        "predicate": "WHERE @user_with_open_dms = True OR @user_who_follow_sender = True;",
+        "description": "Only message users that have open DMs, or users that follow you."
+    }
+}

@@ -1,0 +1,14 @@
+10000 inserts (1 per 100ns)
+Total: 3831ms
+
+10000 inserts (1 per 1us)
+Total: 3849ms
+
+10000 inserts (1 per 10us)
+Total: 4039ms
+
+10000 inserts (1 per 100us)
+Total: 4016ms
+
+10000 inserts (1 per 1ms)
+Total: 11373ms

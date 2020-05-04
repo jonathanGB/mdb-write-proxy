@@ -8,7 +8,9 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::time::Instant;
 
+#[derive(Clone)]
 pub struct WriteProxy {
     pool: Pool,
     noria_db: ControllerHandle<ZookeeperAuthority>,
@@ -27,16 +29,47 @@ pub enum WriteProxyErr<'a> {
     PolicyNotInserted,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TableInfo {
     policies: Option<PoliciesInfo>,
     column_names: Option<Vec<String>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PoliciesInfo {
     startup_policies: Vec<String>,
     predicate: String,
+}
+
+#[derive(Default, Debug)]
+pub struct Timing {
+    constructed_at: Option<Instant>,
+    returned_at: Option<Instant>,
+    start_insert: Option<Instant>,
+    start_transaction: Option<Instant>,
+    completed_policies: Vec<Instant>,
+    completed_insert: Option<Instant>,
+    completed_select_count: Option<Instant>,
+    completed_commit: Option<Instant>,
+}
+
+impl Timing {
+    pub fn new() -> Self {
+        let mut t = Timing::default();
+        t.constructed_at = Some(Instant::now());
+        t
+    }
+
+    pub fn set_returned(&mut self) {
+        self.returned_at = Some(Instant::now());
+    }
+
+    pub fn total_time_millis(&self) -> Option<u128> {
+        match (self.constructed_at, self.returned_at) {
+            (None, _) | (_, None) => None,
+            (Some(start), Some(returned)) => Some(returned.duration_since(start).as_millis()),
+        }
+    }
 }
 
 impl WriteProxy {
@@ -199,13 +232,17 @@ impl WriteProxy {
     }
 
     pub async fn insert<'a>(
-        &'a mut self,
+        &mut self,
         table_name: &'a str,
         record: Vec<mysql_async::Value>,
-    ) -> Result<(), WriteProxyErr<'a>> {
+        mut timing: Timing,
+    ) -> (Timing, Result<(), WriteProxyErr<'a>>) {
+        timing.start_insert = Some(Instant::now());
+
         let table = self.tables.get(table_name);
         if table.is_none() || table.unwrap().column_names.is_none() {
-            return Err(WriteProxyErr::MissingTable(table_name));
+            timing.set_returned();
+            return (timing, Err(WriteProxyErr::MissingTable(table_name)));
         }
 
         let table_info = table.unwrap();
@@ -226,8 +263,12 @@ impl WriteProxy {
             tx_options.set_isolation_level(Some(IsolationLevel::Serializable));
             let mut tx = match self.pool.start_transaction(tx_options).await {
                 Ok(tx) => tx,
-                Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+                Err(e) => {
+                    timing.set_returned();
+                    return (timing, Err(WriteProxyErr::MysqlErr(e)));
+                }
             };
+            timing.start_transaction = Some(Instant::now());
 
             let column_names = table_info.column_names.as_ref().unwrap();
 
@@ -241,8 +282,12 @@ impl WriteProxy {
             for policy in startup_policies {
                 tx = match tx.drop_exec(policy, &params).await {
                     Ok(tx) => tx,
-                    Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+                    Err(e) => {
+                        timing.set_returned();
+                        return (timing, Err(WriteProxyErr::MysqlErr(e)));
+                    }
                 };
+                timing.completed_policies.push(Instant::now());
             }
 
             /*             tx = match tx
@@ -272,23 +317,36 @@ impl WriteProxy {
             // 3. Execute the predicate.
             tx = match tx.drop_exec(insert_predicate, params).await {
                 Ok(tx) => tx,
-                Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+                Err(e) => {
+                    timing.set_returned();
+                    return (timing, Err(WriteProxyErr::MysqlErr(e)));
+                }
             };
+            timing.completed_insert = Some(Instant::now());
 
             // 4. Test the insertion. If `row_count()` is 0, then we know that
             // no rows were inserted. If it's more than 0, then insertion passed
             // all the policies.
             tx = match tx.first::<_, u8>("SELECT row_count();").await {
-                Ok((_, Some(num))) if num == 0 => return Err(WriteProxyErr::PolicyNotInserted),
+                Ok((_, Some(num))) if num == 0 => {
+                    timing.set_returned();
+                    return (timing, Err(WriteProxyErr::PolicyNotInserted));
+                }
                 Ok((tx, Some(_))) => tx, // Insert worked, move on.
                 Ok(_) => unreachable!("SELECT row_count() must return something!"),
-                Err(e) => return Err(WriteProxyErr::MysqlErr(e)),
+                Err(e) => {
+                    timing.set_returned();
+                    return (timing, Err(WriteProxyErr::MysqlErr(e)));
+                }
             };
+            timing.completed_select_count = Some(Instant::now());
 
             // Don't propagate write to Noria, unless the transaction commits.
             if let Err(e) = tx.commit().await {
-                return Err(WriteProxyErr::MysqlErr(e));
+                timing.set_returned();
+                return (timing, Err(WriteProxyErr::MysqlErr(e)));
             }
+            timing.completed_commit = Some(Instant::now());
         }
 
         // 4a. Propagate write to Noria!
@@ -296,16 +354,21 @@ impl WriteProxy {
         for value in record {
             match DataType::try_from(value) {
                 Ok(record) => record_noria.push(record),
-                Err(e) => return Err(WriteProxyErr::MysqlToNoriaDatatypeErr(e)),
+                Err(e) => {
+                    timing.set_returned();
+                    return (timing, Err(WriteProxyErr::MysqlToNoriaDatatypeErr(e)));
+                }
             };
         }
 
-        match self.write_handles.get_mut(table_name) {
+        let res = match self.write_handles.get_mut(table_name) {
             Some(write_handle) => write_handle
                 .insert(record_noria)
                 .await
                 .map_err(|e| WriteProxyErr::TableErr(e)),
             None => unreachable!(format!("No table handle registered for {}", table_name)),
-        }
+        };
+        timing.set_returned();
+        (timing, res)
     }
 }
